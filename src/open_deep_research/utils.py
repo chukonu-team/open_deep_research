@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
 import aiohttp
+from langsmith import traceable
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -40,6 +41,15 @@ TAVILY_SEARCH_DESCRIPTION = (
     "A search engine optimized for comprehensive, accurate, and trusted results. "
     "Useful for when you need to answer questions about current events."
 )
+
+##########################
+# SE4AI Search Tool Utils
+##########################
+SE4AI_SEARCH_DESCRIPTION = (
+    "A real-time, trustworthy, and traceable web search engine. "
+    "Useful for when you need to answer questions about current events."
+)
+SE4AI_DEFAULT_URL = "http://172.31.25.163:19433"
 @tool(description=TAVILY_SEARCH_DESCRIPTION)
 async def tavily_search(
     queries: List[str],
@@ -135,6 +145,7 @@ async def tavily_search(
     
     return formatted_output
 
+@traceable(name="tavily_search_async")
 async def tavily_search_async(
     search_queries, 
     max_results: int = 5, 
@@ -211,6 +222,139 @@ async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
         # Other errors during summarization - log and return original content
         logging.warning(f"Summarization failed with error: {str(e)}, returning original content")
         return webpage_content
+
+##########################
+# SE4AI Search Functions
+##########################
+
+@traceable(name="se4ai_search_async")
+async def se4ai_search_async(
+    search_queries: List[str],
+    max_results: int = 5,
+    topic: Literal["general", "news", "finance"] = "general",
+    config: RunnableConfig = None,
+):
+    """Execute multiple SE4AI search queries asynchronously.
+
+    Args:
+        search_queries: List of search query strings to execute
+        max_results: Maximum number of results per query
+        topic: Topic category for filtering results
+        config: Runtime configuration for API key and URL access
+
+    Returns:
+        List of search response dictionaries from SE4AI API
+    """
+    api_url = get_se4ai_api_url(config)
+    api_key = get_se4ai_api_key(config)
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    async def _search_single(query: str) -> dict:
+        payload = {
+            "query": query,
+            "max_results": max_results,
+            "topic": topic,
+            "search_depth": "basic",
+            "chunks_per_source": 3,
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{api_url.rstrip('/')}/search",
+                    headers=headers,
+                    json=payload,
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data
+                    else:
+                        text = await response.text()
+                        logging.warning(f"SE4AI search failed for query '{query}': {response.status} {text}")
+                        return {"query": query, "documents": [], "passages": []}
+        except Exception as e:
+            logging.warning(f"SE4AI search error for query '{query}': {e}")
+            return {"query": query, "documents": [], "passages": []}
+
+    search_tasks = [_search_single(query) for query in search_queries]
+    search_results = await asyncio.gather(*search_tasks)
+    return search_results
+
+
+@tool(description=SE4AI_SEARCH_DESCRIPTION)
+async def se4ai_search(
+    queries: List[str],
+    max_results: Annotated[int, InjectedToolArg] = 5,
+    topic: Annotated[Literal["general", "news", "finance"], InjectedToolArg] = "general",
+    config: RunnableConfig = None,
+) -> str:
+    """Fetch and format search results from SE4AI search API.
+
+    Args:
+        queries: List of search queries to execute
+        max_results: Maximum number of results to return per query
+        topic: Topic filter for search results (general, news, or finance)
+        config: Runtime configuration for API keys and model settings
+
+    Returns:
+        Formatted string containing search results based on passages
+    """
+    # Step 1: Execute search queries asynchronously
+    search_results = await se4ai_search_async(
+        queries,
+        max_results=max_results,
+        topic=topic,
+        config=config,
+    )
+
+    # Step 2: Collect documents (deduplicated by URL) and passages
+    unique_docs: Dict[str, dict] = {}
+    passage_by_url: Dict[str, List[str]] = {}
+
+    for response in search_results:
+        # Collect documents
+        for doc in response.get("documents", []):
+            url = doc.get("url", "")
+            if url and url not in unique_docs:
+                unique_docs[url] = {
+                    "title": doc.get("title", ""),
+                    "url": url,
+                }
+        # Collect passages grouped by source URL
+        for passage in response.get("passages", []):
+            url = passage.get("url", "")
+            content = passage.get("content", "")
+            if url and content:
+                passage_by_url.setdefault(url, []).append(content)
+
+    # Step 3: Format the final output using passages as content
+    if not unique_docs and not passage_by_url:
+        return "No valid search results found. Please try different search queries or use a different search API."
+
+    # Ensure all passage URLs have doc entries (some passages may reference URLs not in documents)
+    for url in passage_by_url:
+        if url not in unique_docs:
+            unique_docs[url] = {"title": url, "url": url}
+
+    formatted_output = "Search results: \n\n"
+    source_index = 0
+    for url, doc in unique_docs.items():
+        passages = passage_by_url.get(url, [])
+        if not passages:
+            continue
+        source_index += 1
+        content = "\n\n".join(passages)
+        formatted_output += f"\n\n--- SOURCE {source_index}: {doc['title']} ---\n"
+        formatted_output += f"URL: {url}\n\n"
+        formatted_output += f"SUMMARY:\n{content}\n\n"
+        formatted_output += "\n\n" + "-" * 80 + "\n"
+
+    if source_index == 0:
+        return "No valid search results found. Please try different search queries or use a different search API."
+
+    return formatted_output
 
 ##########################
 # Reflection Tool Utils
@@ -553,12 +697,22 @@ async def get_search_tool(search_api: SearchAPI):
         # Configure Tavily search tool with metadata
         search_tool = tavily_search
         search_tool.metadata = {
-            **(search_tool.metadata or {}), 
-            "type": "search", 
+            **(search_tool.metadata or {}),
+            "type": "search",
             "name": "web_search"
         }
         return [search_tool]
-        
+
+    elif search_api == SearchAPI.SE4AI:
+        # Configure SE4AI search tool with metadata
+        search_tool = se4ai_search
+        search_tool.metadata = {
+            **(search_tool.metadata or {}),
+            "type": "search",
+            "name": "web_search"
+        }
+        return [search_tool]
+
     elif search_api == SearchAPI.NONE:
         # No search functionality configured
         return []
@@ -923,3 +1077,24 @@ def get_tavily_api_key(config: RunnableConfig):
         return api_keys.get("TAVILY_API_KEY")
     else:
         return os.getenv("TAVILY_API_KEY")
+
+def get_se4ai_api_key(config: RunnableConfig):
+    """Get SE4AI API key from environment or config."""
+    should_get_from_config = os.getenv("GET_API_KEYS_FROM_CONFIG", "false")
+    if should_get_from_config.lower() == "true":
+        api_keys = config.get("configurable", {}).get("apiKeys", {})
+        if not api_keys:
+            return None
+        return api_keys.get("SE4AI_API_KEY")
+    else:
+        return os.getenv("SE4AI_API_KEY")
+
+def get_se4ai_api_url(config: RunnableConfig):
+    """Get SE4AI API URL from environment or config."""
+    should_get_from_config = os.getenv("GET_API_KEYS_FROM_CONFIG", "false")
+    if should_get_from_config.lower() == "true":
+        configurable = config.get("configurable", {})
+        url = configurable.get("SE4AI_API_URL")
+        if url:
+            return url
+    return os.getenv("SE4AI_API_URL", SE4AI_DEFAULT_URL)

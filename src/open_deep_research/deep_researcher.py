@@ -18,6 +18,7 @@ from langgraph.types import Command
 
 from open_deep_research.configuration import (
     Configuration,
+    SearchAPI,
 )
 from open_deep_research.prompts import (
     clarify_with_user_instructions,
@@ -43,6 +44,7 @@ from open_deep_research.utils import (
     anthropic_websearch_called,
     get_all_tools,
     get_api_key_for_model,
+    get_config_value,
     get_model_token_limit,
     get_notes_from_tool_calls,
     get_today_str,
@@ -397,9 +399,19 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     }
     
     # Prepare system prompt with MCP context if available
+    search_api = SearchAPI(get_config_value(configurable.search_api))
+    search_tool_name_map = {
+        SearchAPI.TAVILY: "tavily_search",
+        SearchAPI.SE4AI: "se4ai_search",
+        SearchAPI.ANTHROPIC: "web_search",
+        SearchAPI.OPENAI: "web_search",
+        SearchAPI.NONE: "web_search",
+    }
+    search_tool_name = search_tool_name_map.get(search_api, "web_search")
     researcher_prompt = research_system_prompt.format(
-        mcp_prompt=configurable.mcp_prompt or "", 
-        date=get_today_str()
+        mcp_prompt=configurable.mcp_prompt or "",
+        date=get_today_str(),
+        search_tool_name=search_tool_name,
     )
     
     # Configure model with tools, retry logic, and settings
